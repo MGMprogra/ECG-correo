@@ -1,0 +1,156 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP_Mail_Client.h>
+
+// Configuración OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Pines
+const int ecgPin = 36;  // Entrada analógica del ECG
+const int ledPin = 2;   // LED indicador
+
+// Parámetros de umbral y rango
+const int threshold = 2700;
+const int bpmLowLimit = 40;
+const int bpmHighLimit = 100;
+const unsigned long alertDelay = 4000;
+
+unsigned long lastBeatTime = 0;
+unsigned long outOfRangeStart = 0;
+bool isOutOfRange = false;
+bool emailSent = false;
+int bpm = 0;
+
+// Configuración WiFi y correo
+#define WIFI_SSID "TecNM-ITT"
+#define WIFI_PASSWORD ""
+#define SMTP_HOST "smtp.gmail.com"
+#define SMTP_PORT 465
+#define AUTHOR_EMAIL "proyectomicrosen@gmail.com"
+#define AUTHOR_PASSWORD "fefyhlkndwtrwnsk"
+#define RECIPIENT_EMAIL "marco.tono.gm@gmail.com"
+
+SMTPSession smtp;
+
+void smtpCallback(SMTP_Status status) {
+  Serial.println(status.info());
+  if (status.success()) {
+    Serial.println("Email enviado correctamente.");
+    smtp.sendingResult.clear();
+  } else {
+    Serial.println("Fallo al enviar el correo.");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+
+  // Inicializa OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Fallo al inicializar pantalla OLED");
+    while (true);
+  }
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("ECG READY");
+  display.display();
+
+  // Conectar Wi-Fi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Conectando a WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConectado a WiFi");
+
+  // SMTP
+  smtp.debug(1);
+  smtp.callback(smtpCallback);
+}
+
+void loop() {
+  int ecgValue = analogRead(ecgPin);
+  Serial.println(ecgValue);
+
+  if (ecgValue > threshold) {
+    unsigned long currentTime = millis();
+
+    if (currentTime - lastBeatTime > 300) {
+      unsigned long interval = currentTime - lastBeatTime;
+      bpm = 60000 / interval;
+      lastBeatTime = currentTime;
+
+      // Mostrar en pantalla
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println("PULSACIONES");
+
+      display.setTextSize(3);
+      display.setCursor(0, 16);
+      display.print(bpm);
+      display.println(" BPM");
+
+      // Fuera de rango
+      if (bpm < bpmLowLimit || bpm > bpmHighLimit) {
+        if (!isOutOfRange) {
+          outOfRangeStart = currentTime;
+          isOutOfRange = true;
+        } else if (currentTime - outOfRangeStart >= alertDelay) {
+          digitalWrite(ledPin, HIGH);
+          display.setTextSize(1);
+          display.setCursor(0, 50);
+          display.println("! Fuera de rango !");
+
+          if (!emailSent) {
+            // Enviar correo
+            Session_Config config;
+            config.server.host_name = SMTP_HOST;
+            config.server.port = SMTP_PORT;
+            config.login.email = AUTHOR_EMAIL;
+            config.login.password = AUTHOR_PASSWORD;
+            config.time.ntp_server = F("pool.ntp.org,time.nist.gov");
+            config.time.gmt_offset = 3;
+            config.time.day_light_offset = 0;
+
+            SMTP_Message message;
+            message.sender.name = F("ESP32 ECG");
+            message.sender.email = AUTHOR_EMAIL;
+            message.subject = F("Alerta: Ritmo cardíaco fuera de rango");
+            message.addRecipient(F("Destinatario"), RECIPIENT_EMAIL);
+            message.text.content = "El ritmo cardíaco está fuera del rango saludable.";
+            message.text.charSet = "us-ascii";
+            message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
+
+            if (!smtp.connect(&config)) {
+              Serial.printf("Error de conexión: %d, %s\n", smtp.statusCode(), smtp.errorReason().c_str());
+            } else {
+              if (!MailClient.sendMail(&smtp, &message)) {
+                Serial.printf("Error al enviar correo: %d, %s\n", smtp.statusCode(), smtp.errorReason().c_str());
+              } else {
+                emailSent = true;
+              }
+            }
+          }
+        }
+      } else {
+        isOutOfRange = false;
+        digitalWrite(ledPin, LOW);
+        emailSent = false;
+      }
+
+      display.display();
+    }
+  }
+
+  delay(5);
+}
