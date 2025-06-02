@@ -1,0 +1,241 @@
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_Fingerprint.h>
+#include <ESP32Servo.h>
+#include <DHT.h>
+
+// === CONFIG OLED ===
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET   -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// === CONFIG DHT11 ===
+#define DHTPIN    15     // Pin de datos del DHT11
+#define DHTTYPE   DHT11
+DHT dht(DHTPIN, DHTTYPE);
+unsigned long lastTempRead      = 0;
+const unsigned long TEMP_INTERVAL = 2000;  // 2 s
+
+// === CONFIG RELAY ===
+const int relayPin = 26;  // Pin que controla el relay
+
+// === CONFIG FINGERPRINT ===
+// UART2 para el sensor AS608 (GPIO 16 y 17)
+HardwareSerial fingerSerial(2);
+Adafruit_Fingerprint finger(&fingerSerial);
+
+// === CONFIG SERVO ===
+Servo doorServo;
+const int servoPin      = 4;
+const int openAngle     = 180;
+const int closedAngle   = 90;
+const unsigned long openTime = 5000; // 5 segundos
+
+// === PINES ===
+const int matchBtnPin  = 14;  // Botón MATCH (huella)
+const int manualBtnPin = 27;  // Botón MANUAL (abrir puerta)
+
+uint8_t enrollID = 1;
+
+void setup() {
+  // --- Serial para huella y debug ---
+  Serial.begin(115200);
+  while (!Serial);
+
+  // --- OLED ---
+  Wire.begin();
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("ERROR: OLED no encontrado");
+    while (true) delay(10);
+  }
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("OLED listo");
+  display.display();
+  delay(1000);
+
+  // --- DHT11 ---
+  dht.begin();
+
+  // --- Pines de salida ---
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW); // asegurarse de que esté apagado al inicio
+
+  // --- Botones ---
+  pinMode(matchBtnPin, INPUT_PULLUP);
+  pinMode(manualBtnPin, INPUT_PULLUP);
+
+  // --- Servo ---
+  doorServo.setPeriodHertz(50);
+  doorServo.attach(servoPin, 500, 2400);
+  doorServo.write(closedAngle);
+
+  // --- Huella ---
+  fingerSerial.begin(57600, SERIAL_8N1, 16, 17);
+  finger.begin(57600);
+  if (!finger.verifyPassword()) {
+    Serial.println("ERROR: Sensor de huella no detectado");
+    while (true) delay(10);
+  }
+  Serial.println("Sensor de huella listo.");
+  printFingerprintMenu();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // 1) Lectura periódica de temperatura
+  if (now - lastTempRead >= TEMP_INTERVAL) {
+    lastTempRead = now;
+    float t = dht.readTemperature();
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    if (isnan(t)) {
+      display.setTextSize(1);
+      display.println("Error DHT11");
+      digitalWrite(relayPin, LOW);
+    } else {
+      display.print(t, 1);
+      display.println(" C");
+      // Control de relay: activa si t > 30°C
+      if (t > 30.0) {
+        digitalWrite(relayPin, HIGH);
+      } else {
+        digitalWrite(relayPin, LOW);
+      }
+    }
+    display.display();
+  }
+
+  // 2) Botón MATCH (huella)
+  if (digitalRead(matchBtnPin) == LOW) {
+    delay(50);
+    if (digitalRead(matchBtnPin) == LOW) {
+      Serial.println("\n>>> Botón MATCH pulsado!");
+      matchOnce();
+      printFingerprintMenu();
+      while (digitalRead(matchBtnPin) == LOW) delay(10);
+    }
+  }
+
+  // 3) Botón MANUAL (abre puerta sin huella)
+  if (digitalRead(manualBtnPin) == LOW) {
+    delay(50);
+    if (digitalRead(manualBtnPin) == LOW) {
+      Serial.println("\n>>> Botón MANUAL pulsado!");
+      abrirPuerta();
+      while (digitalRead(manualBtnPin) == LOW) delay(10);
+    }
+  }
+
+  // 4) Comandos Serial para huella (E, D, X)
+  if (Serial.available()) {
+    char c = toupper(Serial.read());
+    switch (c) {
+      case 'E':
+        Serial.print("Registrar huella en ID #"); Serial.println(enrollID);
+        enrollFingerprint(enrollID++);
+        printFingerprintMenu();
+        break;
+      case 'D': {
+        while (Serial.available()) Serial.read();
+        Serial.println("ID a borrar:");
+        while (!Serial.available()) delay(10);
+        int id = Serial.parseInt();
+        while (Serial.available()) Serial.read();
+        if (finger.deleteModel(id) == FINGERPRINT_OK)
+          Serial.println("Huella borrada.");
+        else
+          Serial.println("Error al borrar.");
+        printFingerprintMenu();
+        break;
+      }
+      case 'X':
+        while (Serial.available()) Serial.read();
+        Serial.println("Borrar TODAS? s/n");
+        {
+          char r;
+          do {
+            while (!Serial.available()) delay(10);
+            r = tolower(Serial.read());
+          } while (r!='s' && r!='n');
+          if (r=='s' && finger.emptyDatabase() == FINGERPRINT_OK)
+            Serial.println("Base de datos vaciada.");
+          else
+            Serial.println("Operación cancelada o error.");
+        }
+        printFingerprintMenu();
+        break;
+      default:
+        printFingerprintMenu();
+    }
+  }
+}
+
+// === Funciones Fingerprint ===
+
+void printFingerprintMenu() {
+  Serial.println("\n=== MENU HUELLA ===");
+  Serial.println("[E] Enroll");
+  Serial.println("[D] Delete ID");
+  Serial.println("[X] Borrar TODAS");
+  Serial.println("Btn MATCH → GPIO14");
+  Serial.println("Btn MANUAL→ GPIO27");
+  Serial.println("-------------------");
+}
+
+uint8_t enrollFingerprint(uint8_t id) {
+  uint8_t p;
+  Serial.println("1) Coloca tu dedo...");
+  while ((p = finger.getImage()) != FINGERPRINT_OK) {
+    if (p != FINGERPRINT_NOFINGER) return p;
+    delay(100);
+  }
+  p = finger.image2Tz(1); if (p != FINGERPRINT_OK) return p;
+  Serial.println("2) Retira dedo...");
+  delay(1500);
+  Serial.println("3) Mismo dedo...");
+  while ((p = finger.getImage()) != FINGERPRINT_OK) {
+    if (p != FINGERPRINT_NOFINGER) return p;
+    delay(100);
+  }
+  p = finger.image2Tz(2); if (p != FINGERPRINT_OK) return p;
+  p = finger.createModel();    if (p != FINGERPRINT_OK) return p;
+  p = finger.storeModel(id);
+  if (p == FINGERPRINT_OK) Serial.println("Huella registrada.");
+  else                      Serial.println("Error guardando huella.");
+  return p;
+}
+
+void matchOnce() {
+  uint8_t p;
+  while ((p = finger.getImage()) == FINGERPRINT_NOFINGER) delay(100);
+  if (p != FINGERPRINT_OK) {
+    Serial.print("Error img: "); Serial.println(p);
+    return;
+  }
+  p = finger.image2Tz();
+  if (p != FINGERPRINT_OK) {
+    Serial.print("Error TZ: "); Serial.println(p);
+    return;
+  }
+  p = finger.fingerFastSearch();
+  if (p == FINGERPRINT_OK) {
+    Serial.print("Huella ID #"); Serial.print(finger.fingerID);
+    Serial.print("  Confianza: "); Serial.println(finger.confidence);
+    abrirPuerta();
+  } else {
+    Serial.println("Huella NO autorizada.");
+  }
+}
+
+void abrirPuerta() {
+  doorServo.write(openAngle);
+  delay(openTime);
+  doorServo.write(closedAngle);
+  Serial.println("Puerta cerrada.");
+}
